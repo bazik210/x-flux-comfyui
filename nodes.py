@@ -355,15 +355,12 @@ class XlabsSampler:
         except:
             guidance = 1.0
 
-        device=mm.get_torch_device()
+        device = mm.get_torch_device()
         if torch.backends.mps.is_available():
             device = torch.device("mps")
-        if torch.cuda.is_bf16_supported():
-            dtype_model = torch.bfloat16
-        else:
-            dtype_model = torch.float16
-        #dtype_model = torch.bfloat16#model.model.diffusion_model.img_in.weight.dtype
-        offload_device=mm.unet_offload_device()
+        offload_device = mm.unet_offload_device()
+		#dtype_model = torch.bfloat16#model.model.diffusion_model.img_in.weight.dtype
+        dtype_model = torch.float16 if mm.should_use_fp16(device) else torch.bfloat16
 
         torch.manual_seed(noise_seed)
 
@@ -374,33 +371,42 @@ class XlabsSampler:
         x = get_noise(
             bc, height, width, device=device,
             dtype=dtype_model, seed=noise_seed
-        )
-        orig_x = None
-        if c==16:
-            orig_x=latent_image['samples']
-            lat_processor2 = LATENT_PROCESSOR_COMFY()
-            orig_x=lat_processor2.go_back(orig_x)
-            orig_x=orig_x.to(device, dtype=dtype_model)
+        ).to(device, dtype=dtype_model)
 
-        
+        orig_x = None
+        if c == 16:
+            orig_x = latent_image['samples'].to(device, dtype=dtype_model)
+            lat_processor2 = LATENT_PROCESSOR_COMFY()
+            orig_x = lat_processor2.go_back(orig_x).to(device, dtype=dtype_model)
+
         timesteps = get_schedule(
             steps,
             (width // 8) * (height // 8) // 4,
             shift=True,
         )
+
         try:
-            inmodel.to(device)
+            inmodel.to(device, dtype=dtype_model)
         except:
             pass
-        x.to(device)
-        
-        inmodel.diffusion_model.to(device)
-        inp_cond = prepare(conditioning[0][0], conditioning[0][1]['pooled_output'], img=x)
-        neg_inp_cond = prepare(neg_conditioning[0][0], neg_conditioning[0][1]['pooled_output'], img=x)
+        inmodel.diffusion_model.to(device, dtype=dtype_model)
 
-        if denoise_strength<=0.99:
+        inp_cond = prepare(
+            conditioning[0][0].to(device, dtype=dtype_model),
+            conditioning[0][1]['pooled_output'].to(device, dtype=dtype_model),
+            img=x
+        )
+        neg_inp_cond = prepare(
+            neg_conditioning[0][0].to(device, dtype=dtype_model),
+            neg_conditioning[0][1]['pooled_output'].to(device, dtype=dtype_model),
+            img=x
+        )
+
+        print(f"--- Sampler: Input x dtype: {x.dtype}, Conditioning dtype: {inp_cond['txt'].dtype}, ")
+
+        if denoise_strength <= 0.99:
             try:
-                timesteps=timesteps[:int(len(timesteps)*denoise_strength)]
+                timesteps = timesteps[:int(len(timesteps) * denoise_strength)]
             except:
                 pass
         # for sampler preview
@@ -409,11 +415,14 @@ class XlabsSampler:
 
         if controlnet_condition is None:
             x = denoise(
-                inmodel.diffusion_model, **inp_cond, timesteps=timesteps, guidance=guidance,
+                inmodel.diffusion_model,
+                **{k: v.to(device, dtype=dtype_model) for k, v in inp_cond.items()},
+                timesteps=timesteps,
+                guidance=guidance,
                 timestep_to_start_cfg=timestep_to_start_cfg,
-                neg_txt=neg_inp_cond['txt'],
-                neg_txt_ids=neg_inp_cond['txt_ids'],
-                neg_vec=neg_inp_cond['vec'],
+                neg_txt=neg_inp_cond['txt'].to(device, dtype=dtype_model),
+                neg_txt_ids=neg_inp_cond['txt_ids'].to(device, dtype=dtype_model),
+                neg_vec=neg_inp_cond['vec'].to(device, dtype=dtype_model),
                 true_gs=true_gs,
                 image2image_strength=image_to_image_strength,
                 orig_image=orig_x,
@@ -421,18 +430,17 @@ class XlabsSampler:
                 width=width,
                 height=height,
             )
-
         else:
             def prepare_controlnet_condition(controlnet_condition):
-                controlnet = controlnet_condition['model']
-                controlnet_image = controlnet_condition['img']
+                controlnet = controlnet_condition['model'].to(device, dtype=dtype_model)
+                controlnet_image = controlnet_condition['img'].to(device, dtype=dtype_model)
                 controlnet_image = torch.nn.functional.interpolate(
-                    controlnet_image, size=(height, width), scale_factor=None, mode='bicubic',)
+                    controlnet_image, size=(height, width), mode='bicubic', align_corners=False
+                ).to(device, dtype=dtype_model)
                 controlnet_strength = controlnet_condition['controlnet_strength']
                 controlnet_start = controlnet_condition['start']
                 controlnet_end = controlnet_condition['end']
-                controlnet.to(device, dtype=dtype_model)
-                controlnet_image=controlnet_image.to(device, dtype=dtype_model)
+                print(f"--- Sampler: ControlNet image dtype: {controlnet_image.dtype}")
                 return {
                     "img": controlnet_image,
                     "controlnet_strength": controlnet_strength,
@@ -441,29 +449,30 @@ class XlabsSampler:
                     "end": controlnet_end,
                 }
 
-
             cnet_conditions = [prepare_controlnet_condition(el) for el in controlnet_condition]
             containers = []
             for el in cnet_conditions:
-                start_step = int(el['start']*len(timesteps))
-                end_step = int(el['end']*len(timesteps))
+                start_step = int(el['start'] * len(timesteps))
+                end_step = int(el['end'] * len(timesteps))
                 container = ControlNetContainer(el['model'], el['img'], el['controlnet_strength'], start_step, end_step)
                 containers.append(container)
 
-            mm.load_models_gpu([model,])
+            mm.load_models_gpu([model])
             #mm.load_model_gpu(controlnet)
 
-            total_steps = len(timesteps)
+            #total_steps = len(timesteps)
 
             x = denoise_controlnet(
-                inmodel.diffusion_model, **inp_cond, 
+                inmodel.diffusion_model,
+                **{k: v.to(device, dtype=dtype_model) for k, v in inp_cond.items()},
                 controlnets_container=containers,
-                timesteps=timesteps, guidance=guidance,
+                timesteps=timesteps,
+                guidance=guidance,
                 #controlnet_cond=controlnet_image,
                 timestep_to_start_cfg=timestep_to_start_cfg,
-                neg_txt=neg_inp_cond['txt'],
-                neg_txt_ids=neg_inp_cond['txt_ids'],
-                neg_vec=neg_inp_cond['vec'],
+                neg_txt=neg_inp_cond['txt'].to(device, dtype=dtype_model),
+                neg_txt_ids=neg_inp_cond['txt_ids'].to(device, dtype=dtype_model),
+                neg_vec=neg_inp_cond['vec'].to(device, dtype=dtype_model),
                 true_gs=true_gs,
                 #controlnet_gs=controlnet_strength,
                 image2image_strength=image_to_image_strength,
@@ -476,7 +485,7 @@ class XlabsSampler:
             )
             #controlnet.to(offload_device)
 
-        x = unpack(x, height, width)
+        x = unpack(x, height, width).to(device, dtype=dtype_model)
         lat_processor = LATENT_PROCESSOR_COMFY()
         x = lat_processor(x)
         lat_ret = {"samples": x}
