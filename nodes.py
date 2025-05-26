@@ -402,8 +402,6 @@ class XlabsSampler:
             img=x
         )
 
-        print(f"--- Sampler: Input x dtype: {x.dtype}, Conditioning dtype: {inp_cond['txt'].dtype}, ")
-
         if denoise_strength <= 0.99:
             try:
                 timesteps = timesteps[:int(len(timesteps) * denoise_strength)]
@@ -440,7 +438,6 @@ class XlabsSampler:
                 controlnet_strength = controlnet_condition['controlnet_strength']
                 controlnet_start = controlnet_condition['start']
                 controlnet_end = controlnet_condition['end']
-                print(f"--- Sampler: ControlNet image dtype: {controlnet_image.dtype}")
                 return {
                     "img": controlnet_image,
                     "controlnet_strength": controlnet_strength,
@@ -551,7 +548,7 @@ class LoadFluxIPAdapter:
         ret_ipa["double_blocks"].load_state_dict(blocks)
         pbar.update(1)
         return (ret_ipa,)
-        
+
 
 
 class ApplyFluxIPAdapter:
