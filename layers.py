@@ -287,7 +287,8 @@ class ImageProjModel(torch.nn.Module):
         self.norm = torch.nn.LayerNorm(cross_attention_dim)
 
     def forward(self, image_embeds):
-        embeds = image_embeds
+        dtype = self.proj.weight.dtype
+        embeds = image_embeds.to(dtype)
         clip_extra_context_tokens = self.proj(embeds).reshape(
             -1, self.clip_extra_context_tokens, self.cross_attention_dim
         )
