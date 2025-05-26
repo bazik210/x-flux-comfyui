@@ -403,7 +403,8 @@ class XlabsSampler:
             img=x
         )
 
-        print(f"--- Sampler: Input x dtype: {x.dtype}, Conditioning dtype: {inp_cond['txt'].dtype}, ")
+        print(f"--- Sampler: Input x dtype: {x.dtype}, Conditioning dtype: {inp_cond['txt'].dtype}, "
+              f"Timesteps type: {type(timesteps)}, Length: {len(timesteps)}, True_gs: {true_gs}")
 
         if denoise_strength <= 0.99:
             try:
@@ -560,7 +561,7 @@ class LoadFluxIPAdapter:
         ret_ipa["double_blocks"].load_state_dict(blocks)
         pbar.update(1)
         return (ret_ipa,)
-        
+
 
 
 class ApplyFluxIPAdapter:
