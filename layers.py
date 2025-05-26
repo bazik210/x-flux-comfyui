@@ -256,7 +256,7 @@ class IPProcessor(nn.Module):
         ip_query = img_q  # latent sample query
         ip_key = self.ip_adapter_double_stream_k_proj(self.ip_hidden_states)
         ip_value = self.ip_adapter_double_stream_v_proj(self.ip_hidden_states)
-        
+
         # Reshape projections for multi-head attention
         ip_key = rearrange(ip_key, 'B L (H D) -> B H L D', H=attn.num_heads)
         ip_value = rearrange(ip_value, 'B L (H D) -> B H L D', H=attn.num_heads)
@@ -277,21 +277,36 @@ class ImageProjModel(torch.nn.Module):
     https://github.com/tencent-ailab/IP-Adapter/blob/main/ip_adapter/ip_adapter.py#L28
     """
 
-    def __init__(self, cross_attention_dim=1024, clip_embeddings_dim=1024, clip_extra_context_tokens=4):
+    def __init__(self, cross_attention_dim=4096, clip_embeddings_dim=768, clip_extra_context_tokens=16):
         super().__init__()
-
-        self.generator = None
         self.cross_attention_dim = cross_attention_dim
         self.clip_extra_context_tokens = clip_extra_context_tokens
+        self.expected_clip_dim = clip_embeddings_dim
         self.proj = torch.nn.Linear(clip_embeddings_dim, self.clip_extra_context_tokens * cross_attention_dim)
         self.norm = torch.nn.LayerNorm(cross_attention_dim)
+        self.adaptor = None
 
-    def forward(self, image_embeds):
+    def forward(self, image_embeds, input_clip_dim=None):
         dtype = self.proj.weight.dtype
         embeds = image_embeds.to(dtype)
+        print(f"--- IPAdapter: Image embeds shape: {embeds.shape}")
+        
+        actual_clip_dim = embeds.shape[-1] if input_clip_dim is None else input_clip_dim
+        print(f"--- IPAdapter: Actual clip dim: {actual_clip_dim}, Expected: {self.expected_clip_dim}")
+        
+        if actual_clip_dim != self.expected_clip_dim:
+            if self.adaptor is None:
+                self.adaptor = torch.nn.Linear(actual_clip_dim, self.expected_clip_dim).to(device=embeds.device, dtype=dtype)
+                print(f"--- IPAdapter: Initialized adaptor for {actual_clip_dim} -> {self.expected_clip_dim}")
+            embeds = self.adaptor(embeds)
+            print(f"--- IPAdapter: Adapted embeds shape: {embeds.shape}")
+        else:
+            print(f"--- IPAdapter: No adaptation needed, embeds shape: {embeds.shape}")
+        
         clip_extra_context_tokens = self.proj(embeds).reshape(
             -1, self.clip_extra_context_tokens, self.cross_attention_dim
         )
+        print(f"--- IPAdapter: Projected embeds shape: {clip_extra_context_tokens.shape}")
         clip_extra_context_tokens = self.norm(clip_extra_context_tokens)
         return clip_extra_context_tokens
 

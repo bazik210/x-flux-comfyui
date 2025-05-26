@@ -5,6 +5,7 @@ import comfy.model_patcher as mp
 from comfy.utils import ProgressBar
 from comfy.clip_vision import load as load_clip_vision
 from comfy.clip_vision import clip_preprocess, Output
+from torchvision.transforms import Resize, Normalize
 import latent_preview
 import copy
 
@@ -526,18 +527,26 @@ class LoadFluxIPAdapter:
             if key.startswith("ip_adapter_proj_model"):
                 proj[key[len("ip_adapter_proj_model."):]] = value
         pbar.update(1)
-        img_vec_in_dim=768
-        context_in_dim=4096
-        num_ip_tokens=16        
-        if ckpt['ip_adapter_proj_model.proj.weight'].shape[0]//4096==4:
-            num_ip_tokens=4
-        else:
-            num_ip_tokens=16
-        improj = ImageProjModel(context_in_dim, img_vec_in_dim, num_ip_tokens)
+        
+        # Dynamically determine parameters from weights
+        proj_weight_shape = proj['proj.weight'].shape  # [65536, 768]
+        norm_weight_shape = proj['norm.weight'].shape  # [4096]
+        cross_attention_dim = norm_weight_shape[0]  # 4096
+        clip_embeddings_dim = proj_weight_shape[1]  # 768
+        clip_extra_context_tokens = proj_weight_shape[0] // cross_attention_dim  # 65536 / 4096 = 16
+        
+        print(f"--- IPAdapter: Detected cross_attention_dim: {cross_attention_dim}, "
+              f"clip_embeddings_dim: {clip_embeddings_dim}, "
+              f"clip_extra_context_tokens: {clip_extra_context_tokens}")
+        
+        improj = ImageProjModel(
+            cross_attention_dim=cross_attention_dim,
+            clip_embeddings_dim=clip_embeddings_dim,
+            clip_extra_context_tokens=clip_extra_context_tokens
+        )
         improj.load_state_dict(proj)
         pbar.update(1)
         ret_ipa["ip_adapter_proj_model"] = improj
-
         ret_ipa["double_blocks"] = torch.nn.ModuleList([IPProcessor(4096, 3072) for i in range(19)])
         ret_ipa["double_blocks"].load_state_dict(blocks)
         pbar.update(1)
@@ -582,6 +591,18 @@ class ApplyFluxIPAdapter:
         tyanochky = bi.model
 
         clip = ip_adapter_flux['clip_vision']
+        print(f"--- IPAdapter: Input image shape: {image.shape}")
+
+        # Image processing
+        image = image.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+        image = Resize((336, 336), antialias=True)(image)  # Ресайз до 336x336
+        image = image.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
+        print(f"--- IPAdapter: Resized image shape: {image.shape}")
+        
+        # Ensure values are in the range [0, 1]
+        if image.max() > 1.0:
+            image = image / 255.0
+        print(f"--- IPAdapter: Image range after normalization: [{image.min().item()}, {image.max().item()}]")
 
         if isinstance(clip, FluxClipViT):
             #torch.Size([1, 526, 526, 3])
@@ -589,13 +610,14 @@ class ApplyFluxIPAdapter:
             #print(image.shape)
             #print(image)
             clip_device = next(clip.model.parameters()).device
-            image = torch.clip(image*255, 0.0, 255)
+            #image = torch.clip(image*255, 0.0, 255)
             out = clip(image).to(dtype=dtype)
             neg_out = clip(torch.zeros_like(image)).to(dtype=dtype)
         else:
             print("Using old vit clip")
             clip_device = next(clip.parameters()).device
-            pixel_values = clip_preprocess(image.to(clip_device)).float()
+            clip_preprocess = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            pixel_values = clip_preprocess(image.permute(0, 3, 1, 2).to(clip_device)).float()
             out = clip(pixel_values=pixel_values)
             neg_out = clip(pixel_values=torch.zeros_like(pixel_values))    
             neg_out = neg_out[2].to(dtype=dtype)
@@ -683,6 +705,18 @@ class ApplyAdvancedFluxIPAdapter:
         tyanochky = bi.model
 
         clip = ip_adapter_flux['clip_vision']
+        print(f"--- IPAdapter: Input image shape: {image.shape}")
+        
+        # Image processing
+        image = image.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+        image = Resize((336, 336), antialias=True)(image)  # Ресайз до 336x336
+        image = image.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
+        print(f"--- IPAdapter: Resized image shape: {image.shape}")
+        
+        # Ensure values are in the range [0, 1]
+        if image.max() > 1.0:
+            image = image / 255.0
+        print(f"--- IPAdapter: Image range after normalization: [{image.min().item()}, {image.max().item()}]")
         
         if isinstance(clip, FluxClipViT):
             #torch.Size([1, 526, 526, 3])
@@ -690,13 +724,15 @@ class ApplyAdvancedFluxIPAdapter:
             #print(image.shape)
             #print(image)
             clip_device = next(clip.model.parameters()).device
-            image = torch.clip(image*255, 0.0, 255)
+            #image = torch.clip(image*255, 0.0, 255)
             out = clip(image).to(dtype=dtype)
             neg_out = clip(torch.zeros_like(image)).to(dtype=dtype)
         else:
             print("Using old vit clip")
             clip_device = next(clip.parameters()).device
-            pixel_values = clip_preprocess(image.to(clip_device)).float()
+            clip_preprocess = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            pixel_values = clip_preprocess(image.permute(0, 3, 1, 2).to(clip_device)).float()  # [B, H, W, C] -> [B, C, H, W]
+            print(f"--- IPAdapter: Pixel values shape: {pixel_values.shape}")
             out = clip(pixel_values=pixel_values)
             neg_out = clip(pixel_values=torch.zeros_like(pixel_values))
             neg_out = neg_out[2].to(dtype=dtype)
@@ -718,6 +754,7 @@ class ApplyAdvancedFluxIPAdapter:
         if out.dim() == 3:  # [batch, seq_len, dim]
             out = torch.mean(out, 1)  # [batch, dim]
             neg_out = torch.mean(neg_out, 1)
+        print(f"--- IPAdapter: out shape after: {out.shape}")
         ip_projes = ip_adapter_flux['ip_adapter_proj_model'](out.to(ip_projes_dev, dtype=dtype)).to(device, dtype=dtype)
         ip_neg_pr = ip_adapter_flux['ip_adapter_proj_model'](neg_out.to(ip_projes_dev, dtype=dtype)).to(device, dtype=dtype)
 
@@ -746,6 +783,7 @@ class ApplyAdvancedFluxIPAdapter:
             ipad_blocks.append(npp)
         pbar.update(mul)
 
+        print("--- IPAdapter: Starting patching")
         i = 0
         for name, _ in attn_processors(tyanochky.diffusion_model).items():
             attribute = f"diffusion_model.{name}"
@@ -757,7 +795,9 @@ class ApplyAdvancedFluxIPAdapter:
             processor = merge_loras(old, ipad_blocks[i])
             processor.to(device, dtype=dtype)
             bi.add_object_patch(attribute, processor)
+            print(f"--- IPAdapter: Patched block {i}, processor: {type(processor)}")
             i += 1
+        print("--- IPAdapter: Patching complete")
         pbar.update(mul)
         return (bi,)
 

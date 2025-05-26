@@ -8,12 +8,11 @@ from transformers import (CLIPImageProcessor,
 
 
 class FluxClipViT:
-    def __init__(self, path_model = None):
+    def __init__(self, path_model=None):
         if path_model is None:
             self.model = CLIPVisionModelWithProjection.from_pretrained(
                 "openai/clip-vit-large-patch14"
             )
-            
         else:
             _dir = os.path.dirname(path_model)
             write_config(_dir)
@@ -23,17 +22,30 @@ class FluxClipViT:
             self.model = CLIPVisionModelWithProjection.from_pretrained(
                 path_model,
                 config=config,
-                use_safetensors = True,
+                use_safetensors=True,
             )
-        self.image_processor = CLIPImageProcessor()
+        self.image_processor = CLIPImageProcessor(do_rescale=False)  # Disable resize by default
         self.load_device = next(self.model.parameters()).device
 
     def __call__(self, image):
+        # Ensure input tensor is in [B, C, H, W]
+        if image.shape[-1] == 3:
+            image = image.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+        print(f"--- IPAdapter: CLIP input image shape: {image.shape}, range: [{image.min().item()}, {image.max().item()}]")
+        
         img = self.image_processor(
-            images=image, return_tensors="pt"
-            )
-        img = img.pixel_values
-        return self.model(img).image_embeds
+            images=image,
+            return_tensors="pt",
+            do_rescale=False,  # Disable default rescaling to avoid repeated normalization
+            do_resize=True,
+            size={"height": 336, "width": 336},
+            do_normalize=True,  # Normalization for CLIP (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            input_data_format="channels_first"  # Explicitly set [B, C, H, W] format
+        )
+        img = img["pixel_values"].to(self.load_device)
+        embeds = self.model(img).image_embeds
+        print(f"--- IPAdapter: CLIP output embeds shape: {embeds.shape}")
+        return embeds
 
 
 def write_config(path):
