@@ -5,8 +5,13 @@ import torch
 from einops import rearrange
 from torch import Tensor, nn
 
+import comfy.model_management
+
 from .xflux.src.flux.math import attention, rope
 from .xflux.src.flux.modules.layers import LoRALinearLayer
+
+from comfy.ldm.flux.layers import DoubleStreamBlock, SingleStreamBlock
+from .attention_processor import IPAFluxAttnProcessor2_0
 
 from torch.nn import functional as F
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
@@ -31,6 +36,150 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     if torch.is_floating_point(t):
         embedding = embedding.to(t)
     return embedding
+
+class DoubleStreamBlockIPA(nn.Module):
+    def __init__(self, original_block: DoubleStreamBlock, ip_adapter: list[IPAFluxAttnProcessor2_0], image_emb):
+        super().__init__()
+
+        self.num_heads = original_block.num_heads
+        self.hidden_size = original_block.hidden_size
+        self.img_mod = original_block.img_mod
+        self.img_norm1 = original_block.img_norm1
+        self.img_attn = original_block.img_attn
+
+        self.img_norm2 = original_block.img_norm2
+        self.img_mlp = original_block.img_mlp
+
+        self.txt_mod = original_block.txt_mod
+        self.txt_norm1 = original_block.txt_norm1
+        self.txt_attn = original_block.txt_attn
+
+        self.txt_norm2 = original_block.txt_norm2
+        self.txt_mlp = original_block.txt_mlp
+        self.flipped_img_txt = original_block.flipped_img_txt
+
+        self.ip_adapter = ip_adapter
+        self.image_emb = image_emb
+        self.device = comfy.model_management.get_torch_device()
+
+    def add_adapter(self, ip_adapter: IPAFluxAttnProcessor2_0, image_emb):
+        self.ip_adapter.append(ip_adapter)
+        self.image_emb.append(image_emb)
+    
+    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, t: Tensor, attn_mask=None):
+        img_mod1, img_mod2 = self.img_mod(vec)
+        txt_mod1, txt_mod2 = self.txt_mod(vec)
+
+        # prepare image for attention
+        img_modulated = self.img_norm1(img)
+        img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
+        img_qkv = self.img_attn.qkv(img_modulated)
+        img_q, img_k, img_v = img_qkv.view(img_qkv.shape[0], img_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
+
+        # prepare txt for attention
+        txt_modulated = self.txt_norm1(txt)
+        txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
+        txt_qkv = self.txt_attn.qkv(txt_modulated)
+        txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
+
+        if self.flipped_img_txt:
+             # run actual attention
+            q = torch.cat((img_q, txt_q), dim=2)
+            k = torch.cat((img_k, txt_k), dim=2)
+            v = torch.cat((img_v, txt_v), dim=2)
+            attn_out = attention(q, k, v, pe=pe, mask=attn_mask)
+            img_attn, txt_attn = attn_out[:, :img.shape[1]], attn_out[:, img.shape[1]:]    
+        else:
+            # run actual attention
+            q = torch.cat((txt_q, img_q), dim=2)
+            k = torch.cat((txt_k, img_k), dim=2)
+            v = torch.cat((txt_v, img_v), dim=2)
+            attn_out = attention(q, k, v, pe=pe, mask=attn_mask)
+            txt_attn, img_attn = attn_out[:, :txt.shape[1]], attn_out[:, txt.shape[1]:]
+
+        for adapter, image in zip(self.ip_adapter, self.image_emb):
+            # this does a separate attention for each adapter
+            ip_hidden_states = adapter(self.num_heads, img_q, image, t)
+            if ip_hidden_states is not None:
+                ip_hidden_states = ip_hidden_states[0].to(self.device)
+                #ip_hidden_states = ip_hidden_states.to(self.device)
+                img_attn = img_attn + ip_hidden_states
+
+        # calculate the img bloks
+        img = img + img_mod1.gate * self.img_attn.proj(img_attn)
+        img = img + img_mod2.gate * self.img_mlp((1 + img_mod2.scale) * self.img_norm2(img) + img_mod2.shift)
+
+        # calculate the txt bloks
+        txt += txt_mod1.gate * self.txt_attn.proj(txt_attn)
+        txt += txt_mod2.gate * self.txt_mlp((1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift)
+
+        if txt.dtype == torch.float16:
+            txt = torch.nan_to_num(txt, nan=0.0, posinf=65504, neginf=-65504)
+
+        return img, txt
+
+class SingleStreamBlockIPA(nn.Module):
+    """
+    A DiT block with parallel linear layers as described in
+    https://arxiv.org/abs/2302.05442 and adapted modulation interface.
+    """
+
+    def __init__(self, original_block: SingleStreamBlock, ip_adapter: list[IPAFluxAttnProcessor2_0], image_emb):
+        super().__init__()
+        self.hidden_dim = original_block.hidden_size
+        self.num_heads = original_block.num_heads
+        self.scale = original_block.scale
+
+        self.mlp_hidden_dim = original_block.mlp_hidden_dim
+        # qkv and mlp_in
+        self.linear1 = original_block.linear1
+        # proj and mlp_out
+        self.linear2 = original_block.linear2
+
+        self.norm = original_block.norm
+
+        self.hidden_size = original_block.hidden_size
+        self.pre_norm = original_block.pre_norm
+
+        self.mlp_act = original_block.mlp_act
+        self.modulation = original_block.modulation
+
+        self.ip_adapter = ip_adapter
+        self.image_emb = image_emb
+        self.device = comfy.model_management.get_torch_device()
+
+    def add_adapter(self, ip_adapter: IPAFluxAttnProcessor2_0, image_emb):
+        self.ip_adapter.append(ip_adapter)
+        self.image_emb.append(image_emb)
+
+    def forward(self, x: Tensor, vec: Tensor, pe: Tensor, t:Tensor, attn_mask=None) -> Tensor:
+        mod, _ = self.modulation(vec)
+        x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
+        qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
+
+        q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k = self.norm(q, k, v)
+
+        # compute attention
+        attn = attention(q, k, v, pe=pe, mask=attn_mask)
+
+        for adapter, image in zip(self.ip_adapter, self.image_emb):
+            # this does a separate attention for each adapter
+            # maybe we want a single joint attention call for all adapters?
+            ip_hidden_states = adapter(self.num_heads, q, image, t)
+            if ip_hidden_states is not None:
+                ip_hidden_states = ip_hidden_states[0].to(self.device)
+                #ip_hidden_states = ip_hidden_states.to(self.device)
+                attn = attn + ip_hidden_states
+
+        # compute activation in mlp stream, cat again and run second linear layer
+        output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        x += mod.gate * output
+        if x.dtype == torch.float16:
+            x = torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
+        return x
 
 class DoubleStreamBlockLorasMixerProcessor(nn.Module):
     def __init__(self,):
@@ -183,7 +332,7 @@ class DoubleStreamBlockLoraProcessor(nn.Module):
 class DoubleStreamBlockProcessor(nn.Module):
     def __init__(self):
         super().__init__()
-    def __call__(self, attn, img, txt, vec, pe, **attention_kwargs):
+    def forward(self, attn, img, txt, vec, pe, **attention_kwargs):
         img_mod1, img_mod2 = attn.img_mod(vec)
         txt_mod1, txt_mod2 = attn.txt_mod(vec)
 
@@ -224,6 +373,7 @@ class DoubleStreamBlockProcessor(nn.Module):
 class IPProcessor(nn.Module):
     def __init__(self, context_dim, hidden_dim, ip_hidden_states=None, ip_scale=None, text_scale=None):
         super().__init__()
+        device = comfy.model_management.get_torch_device()
         self.ip_hidden_states = ip_hidden_states
         self.ip_scale = ip_scale
         self.text_scale = text_scale
@@ -241,8 +391,8 @@ class IPProcessor(nn.Module):
         if self.text_scale == 0:
             self.text_scale = 0.0001
         # Initialize projections for IP-adapter
-        self.ip_adapter_double_stream_k_proj = nn.Linear(context_dim, hidden_dim, bias=True)
-        self.ip_adapter_double_stream_v_proj = nn.Linear(context_dim, hidden_dim, bias=True)
+        self.ip_adapter_double_stream_k_proj = nn.Linear(context_dim, hidden_dim, bias=True).to(device)
+        self.ip_adapter_double_stream_v_proj = nn.Linear(context_dim, hidden_dim, bias=True).to(device)
         
         nn.init.zeros_(self.ip_adapter_double_stream_k_proj.weight)
         nn.init.zeros_(self.ip_adapter_double_stream_k_proj.bias)
@@ -253,7 +403,9 @@ class IPProcessor(nn.Module):
     def forward(self, img_q, attn):
         #img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=attn.num_heads, D=attn.head_dim)
         # IP-adapter processing
-        ip_query = img_q  # latent sample query
+        device = comfy.model_management.get_torch_device()
+        ip_query = img_q.to(device)  # latent sample query
+        ip_hidden_states = self.ip_hidden_states.to(device)
         ip_key = self.ip_adapter_double_stream_k_proj(self.ip_hidden_states)
         ip_value = self.ip_adapter_double_stream_v_proj(self.ip_hidden_states)
         
@@ -297,7 +449,7 @@ class ImageProjModel(torch.nn.Module):
 
 
 class DoubleStreamMixerProcessor(DoubleStreamBlockLorasMixerProcessor):
-    def __init__(self,):
+    def __init__(self):
         super().__init__()
         self.ip_adapters = nn.ModuleList()
         
@@ -306,30 +458,34 @@ class DoubleStreamMixerProcessor(DoubleStreamBlockLorasMixerProcessor):
 
     def get_ip_adapters(self):
         return self.ip_adapters
+    
     def set_ip_adapters(self, ip_adapters):
         self.ip_adapters = ip_adapters
+    
     def shift_ip(self, img_qkv, attn, x):
         for block in self.ip_adapters:
             #x = x*block.text_scale
             x += torch.mean(block(img_qkv, attn), dim=0, keepdim=True)
         return x
+    
     def scale_txt(self, txt):
         for block in self.ip_adapters:
             txt = txt * block.text_scale
         return txt
+    
     def add_lora(self, processor):
         if isinstance(processor, DoubleStreamBlockLorasMixerProcessor):
-            self.qkv_lora1+=processor.qkv_lora1
-            self.qkv_lora2+=processor.qkv_lora2
-            self.proj_lora1+=processor.proj_lora1
-            self.proj_lora2+=processor.proj_lora2
-            self.lora_weight+=processor.lora_weight
+            self.qkv_lora1 += processor.qkv_lora1
+            self.qkv_lora2 += processor.qkv_lora2
+            self.proj_lora1 += processor.proj_lora1
+            self.proj_lora2 += processor.proj_lora2
+            self.lora_weight += processor.lora_weight
         elif isinstance(processor, DoubleStreamMixerProcessor):
-            self.qkv_lora1+=processor.qkv_lora1
-            self.qkv_lora2+=processor.qkv_lora2
-            self.proj_lora1+=processor.proj_lora1
-            self.proj_lora2+=processor.proj_lora2
-            self.lora_weight+=processor.lora_weight
+            self.qkv_lora1 += processor.qkv_lora1
+            self.qkv_lora2 += processor.qkv_lora2
+            self.proj_lora1 += processor.proj_lora1
+            self.proj_lora2 += processor.proj_lora2
+            self.lora_weight += processor.lora_weight
         else:
             if hasattr(processor, "qkv_lora1"):
                 self.qkv_lora1.append(processor.qkv_lora1)

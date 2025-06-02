@@ -1,14 +1,13 @@
 import torch
 from einops import rearrange
 from torch import Tensor
+from comfy.ldm.modules.attention import optimized_attention
 
-
-def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
+def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor, mask=None) -> Tensor:
     q, k = apply_rope(q, k, pe)
 
-    x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-    x = rearrange(x, "B H L D -> B L (H D)")
-
+    heads = q.shape[1]
+    x = optimized_attention(q, k, v, heads, skip_reshape=True, mask=mask)
     return x
 
 

@@ -5,12 +5,15 @@ import comfy.model_patcher as mp
 from comfy.utils import ProgressBar
 from comfy.clip_vision import load as load_clip_vision
 from comfy.clip_vision import clip_preprocess, Output
+from .attention_processor import IPAFluxAttnProcessor2_0
+
 import latent_preview
 import copy
 
 import folder_paths
 
 import torch
+import logging
 #from .xflux.src.flux.modules.layers import DoubleStreamBlockLoraProcessor, DoubleStreamBlockProcessor
 #from .xflux.src.flux.model import Flux as ModFlux
 
@@ -355,15 +358,12 @@ class XlabsSampler:
         except:
             guidance = 1.0
 
-        device=mm.get_torch_device()
+        device = mm.get_torch_device()
         if torch.backends.mps.is_available():
             device = torch.device("mps")
-        if torch.cuda.is_bf16_supported():
-            dtype_model = torch.bfloat16
-        else:
-            dtype_model = torch.float16
-        #dtype_model = torch.bfloat16#model.model.diffusion_model.img_in.weight.dtype
-        offload_device=mm.unet_offload_device()
+        offload_device = mm.unet_offload_device()
+		#dtype_model = torch.bfloat16#model.model.diffusion_model.img_in.weight.dtype
+        dtype_model = torch.float16 if mm.should_use_fp16(device) else torch.bfloat16
 
         torch.manual_seed(noise_seed)
 
@@ -374,33 +374,40 @@ class XlabsSampler:
         x = get_noise(
             bc, height, width, device=device,
             dtype=dtype_model, seed=noise_seed
-        )
-        orig_x = None
-        if c==16:
-            orig_x=latent_image['samples']
-            lat_processor2 = LATENT_PROCESSOR_COMFY()
-            orig_x=lat_processor2.go_back(orig_x)
-            orig_x=orig_x.to(device, dtype=dtype_model)
+        ).to(device, dtype=dtype_model)
 
-        
+        orig_x = None
+        if c == 16:
+            orig_x = latent_image['samples'].to(device, dtype=dtype_model)
+            lat_processor2 = LATENT_PROCESSOR_COMFY()
+            orig_x = lat_processor2.go_back(orig_x).to(device, dtype=dtype_model)
+
         timesteps = get_schedule(
             steps,
             (width // 8) * (height // 8) // 4,
             shift=True,
         )
+
         try:
-            inmodel.to(device)
+            inmodel.to(device, dtype=dtype_model)
         except:
             pass
-        x.to(device)
-        
-        inmodel.diffusion_model.to(device)
-        inp_cond = prepare(conditioning[0][0], conditioning[0][1]['pooled_output'], img=x)
-        neg_inp_cond = prepare(neg_conditioning[0][0], neg_conditioning[0][1]['pooled_output'], img=x)
+        inmodel.diffusion_model.to(device, dtype=dtype_model)
 
-        if denoise_strength<=0.99:
+        inp_cond = prepare(
+            conditioning[0][0].to(device, dtype=dtype_model),
+            conditioning[0][1]['pooled_output'].to(device, dtype=dtype_model),
+            img=x
+        )
+        neg_inp_cond = prepare(
+            neg_conditioning[0][0].to(device, dtype=dtype_model),
+            neg_conditioning[0][1]['pooled_output'].to(device, dtype=dtype_model),
+            img=x
+        )
+
+        if denoise_strength <= 0.99:
             try:
-                timesteps=timesteps[:int(len(timesteps)*denoise_strength)]
+                timesteps = timesteps[:int(len(timesteps) * denoise_strength)]
             except:
                 pass
         # for sampler preview
@@ -409,11 +416,14 @@ class XlabsSampler:
 
         if controlnet_condition is None:
             x = denoise(
-                inmodel.diffusion_model, **inp_cond, timesteps=timesteps, guidance=guidance,
+                inmodel.diffusion_model,
+                **{k: v.to(device, dtype=dtype_model) for k, v in inp_cond.items()},
+                timesteps=timesteps,
+                guidance=guidance,
                 timestep_to_start_cfg=timestep_to_start_cfg,
-                neg_txt=neg_inp_cond['txt'],
-                neg_txt_ids=neg_inp_cond['txt_ids'],
-                neg_vec=neg_inp_cond['vec'],
+                neg_txt=neg_inp_cond['txt'].to(device, dtype=dtype_model),
+                neg_txt_ids=neg_inp_cond['txt_ids'].to(device, dtype=dtype_model),
+                neg_vec=neg_inp_cond['vec'].to(device, dtype=dtype_model),
                 true_gs=true_gs,
                 image2image_strength=image_to_image_strength,
                 orig_image=orig_x,
@@ -421,18 +431,16 @@ class XlabsSampler:
                 width=width,
                 height=height,
             )
-
         else:
             def prepare_controlnet_condition(controlnet_condition):
-                controlnet = controlnet_condition['model']
-                controlnet_image = controlnet_condition['img']
+                controlnet = controlnet_condition['model'].to(device, dtype=dtype_model)
+                controlnet_image = controlnet_condition['img'].to(device, dtype=dtype_model)
                 controlnet_image = torch.nn.functional.interpolate(
-                    controlnet_image, size=(height, width), scale_factor=None, mode='bicubic',)
+                    controlnet_image, size=(height, width), mode='bicubic', align_corners=False
+                ).to(device, dtype=dtype_model)
                 controlnet_strength = controlnet_condition['controlnet_strength']
                 controlnet_start = controlnet_condition['start']
                 controlnet_end = controlnet_condition['end']
-                controlnet.to(device, dtype=dtype_model)
-                controlnet_image=controlnet_image.to(device, dtype=dtype_model)
                 return {
                     "img": controlnet_image,
                     "controlnet_strength": controlnet_strength,
@@ -441,29 +449,30 @@ class XlabsSampler:
                     "end": controlnet_end,
                 }
 
-
             cnet_conditions = [prepare_controlnet_condition(el) for el in controlnet_condition]
             containers = []
             for el in cnet_conditions:
-                start_step = int(el['start']*len(timesteps))
-                end_step = int(el['end']*len(timesteps))
+                start_step = int(el['start'] * len(timesteps))
+                end_step = int(el['end'] * len(timesteps))
                 container = ControlNetContainer(el['model'], el['img'], el['controlnet_strength'], start_step, end_step)
                 containers.append(container)
 
-            mm.load_models_gpu([model,])
+            mm.load_models_gpu([model])
             #mm.load_model_gpu(controlnet)
 
-            total_steps = len(timesteps)
+            #total_steps = len(timesteps)
 
             x = denoise_controlnet(
-                inmodel.diffusion_model, **inp_cond, 
+                inmodel.diffusion_model,
+                **{k: v.to(device, dtype=dtype_model) for k, v in inp_cond.items()},
                 controlnets_container=containers,
-                timesteps=timesteps, guidance=guidance,
+                timesteps=timesteps,
+                guidance=guidance,
                 #controlnet_cond=controlnet_image,
                 timestep_to_start_cfg=timestep_to_start_cfg,
-                neg_txt=neg_inp_cond['txt'],
-                neg_txt_ids=neg_inp_cond['txt_ids'],
-                neg_vec=neg_inp_cond['vec'],
+                neg_txt=neg_inp_cond['txt'].to(device, dtype=dtype_model),
+                neg_txt_ids=neg_inp_cond['txt_ids'].to(device, dtype=dtype_model),
+                neg_vec=neg_inp_cond['vec'].to(device, dtype=dtype_model),
                 true_gs=true_gs,
                 #controlnet_gs=controlnet_strength,
                 image2image_strength=image_to_image_strength,
@@ -476,7 +485,7 @@ class XlabsSampler:
             )
             #controlnet.to(offload_device)
 
-        x = unpack(x, height, width)
+        x = unpack(x, height, width).to(device, dtype=dtype_model)
         lat_processor = LATENT_PROCESSOR_COMFY()
         x = lat_processor(x)
         lat_ret = {"samples": x}
@@ -568,8 +577,8 @@ class ApplyFluxIPAdapter:
         dtype = torch.float16 if mm.should_use_fp16(device) else torch.bfloat16
 
         is_patched = is_model_pathched(model.model)
-
         print(f"Is model already patched? {is_patched}")
+        
         mul = 1
         if is_patched:
             pbar = ProgressBar(5)
@@ -601,44 +610,46 @@ class ApplyFluxIPAdapter:
             neg_out = neg_out[2].to(dtype=dtype)
             out = out[2].to(dtype=dtype)
         pbar.update(mul)
-        if not is_patched:
-            print("We are patching diffusion model, be patient please")
-            patches = FluxUpdateModules(tyanochky, pbar)
-            print("Patched succesfully!")
-        else:
-            print("Model already updated")
+
         pbar.update(mul)
 
+        # Getting image_emb
         #TYANOCHKYBY=16
         ip_projes_dev = next(ip_adapter_flux['ip_adapter_proj_model'].parameters()).device
         ip_adapter_flux['ip_adapter_proj_model'].to(dtype=dtype)
         ip_projes = ip_adapter_flux['ip_adapter_proj_model'](out.to(ip_projes_dev, dtype=dtype)).to(device, dtype=dtype)
         ip_neg_pr = ip_adapter_flux['ip_adapter_proj_model'](neg_out.to(ip_projes_dev, dtype=dtype)).to(device, dtype=dtype)
 
-        ipad_blocks = []
-        for block in ip_adapter_flux['double_blocks']:
+        image_emb = ip_projes
+        #print("ip_projes shape:", ip_projes.shape)
+
+        # Collecting ip_attn_procs
+        ip_attn_procs = {}
+        for i, block in enumerate(ip_adapter_flux['double_blocks']):
             ipad = IPProcessor(block.context_dim, block.hidden_dim, ip_projes, ip_scale)
             ipad.load_state_dict(block.state_dict())
-            ipad.in_hidden_states_neg = ip_neg_pr
             ipad.in_hidden_states_pos = ip_projes
+            ipad.in_hidden_states_neg = ip_neg_pr
             ipad.to(dtype=dtype)
-            npp = DoubleStreamMixerProcessor()
-            npp.add_ipadapter(ipad)
-            ipad_blocks.append(npp)
+            npp = IPAFluxAttnProcessor2_0(
+            hidden_size=block.hidden_dim,
+            cross_attention_dim=block.context_dim,
+            scale=ip_scale
+            )
+            npp.to_k_ip.weight.data = ipad.ip_adapter_double_stream_k_proj.weight.data.clone()
+            npp.to_v_ip.weight.data = ipad.ip_adapter_double_stream_v_proj.weight.data.clone()
+            npp.to(dtype=dtype)
+            ip_attn_procs[f"double_blocks.{i}"] = npp
+
         pbar.update(mul)
 
-        i = 0
-        for name, _ in attn_processors(tyanochky.diffusion_model).items():
-            attribute = f"diffusion_model.{name}"
-            #old = copy.copy(get_attr(bi.model, attribute))
-            if attribute in model.object_patches.keys():
-                old = copy.copy(model.object_patches[attribute])
-            else:
-                old = None
-            processor = merge_loras(old, ipad_blocks[i])
-            processor.to(device, dtype=dtype)
-            bi.add_object_patch(attribute, processor)
-            i += 1
+        if not is_patched:
+            print("We are patching diffusion model with IPA blocks, be patient please")
+            FluxUpdateModules(bi, pbar=pbar, ip_attn_procs=ip_attn_procs, image_emb=image_emb, is_patched=False)
+            print("Patched successfully with IPA blocks!")
+        else:
+            print("Model already patched — skipping")
+
         pbar.update(mul)
         return (bi,)
 
