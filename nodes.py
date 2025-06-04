@@ -22,7 +22,7 @@ from .xflux.src.flux.util import (configs, load_ae, load_clip,
 from .utils import (FirstHalfStrengthModel, FluxUpdateModules, LinearStrengthModel, 
                 SecondHalfStrengthModel, SigmoidStrengthModel, attn_processors, 
                 set_attn_processor,
-                is_model_pathched, merge_loras, LATENT_PROCESSOR_COMFY,
+                is_model_patched, merge_loras, LATENT_PROCESSOR_COMFY,
                 ControlNetContainer,
                 comfy_to_xlabs_lora, check_is_comfy_lora)
 from .layers import (DoubleStreamBlockLoraProcessor,
@@ -107,7 +107,7 @@ class LoadFluxLora:
         device=mm.get_torch_device()
         offload_device=mm.unet_offload_device()
 
-        is_patched = is_model_pathched(model.model)
+        is_patched = is_model_patched(model.model)
 
         print(f"Is model already patched? {is_patched}")
         mul = 1
@@ -558,7 +558,6 @@ class ApplyFluxIPAdapter:
                               "ip_adapter_flux": ("IP_ADAPTER_FLUX",),
                               "image": ("IMAGE",),
                               "ip_scale": ("FLOAT", {"default": 0.93, "min": 0.0, "max": 1.0, "step": 0.001}),
-                              #"text_scale": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
                               }}
 
     RETURN_TYPES = ("MODEL",)
@@ -567,86 +566,81 @@ class ApplyFluxIPAdapter:
     CATEGORY = "XLabsNodes"
 
     def applymodel(self, model, ip_adapter_flux, image, ip_scale):
-        debug = False
+            debug = False
 
-        device = mm.get_torch_device()
-        offload_device = mm.unet_offload_device()
-        dtype = torch.float16 if mm.should_use_fp16(device) else torch.bfloat16
+            device = mm.get_torch_device()
+            offload_device = mm.unet_offload_device()
+            dtype = torch.float16 if mm.should_use_fp16(device) else torch.bfloat16
 
-        is_patched = is_model_pathched(model.model)
-
-        print(f"Is model already patched? {is_patched}")
-        mul = 1
-        if is_patched:
-            pbar = ProgressBar(5)
-        else:
-            mul = 3
-            count = len(model.model.diffusion_model.double_blocks)
-            pbar = ProgressBar(5*mul+count)
-
-        bi = model.clone()
-        tyanochky = bi.model
-
-        clip = ip_adapter_flux['clip_vision']
-
-        if isinstance(clip, FluxClipViT):
-            #torch.Size([1, 526, 526, 3])
-            #image = torch.permute(image, (0, ))
-            #print(image.shape)
-            #print(image)
-            clip_device = next(clip.model.parameters()).device
-            image = torch.clip(image*255, 0.0, 255)
-            out = clip(image).to(dtype=dtype)
-            neg_out = clip(torch.zeros_like(image)).to(dtype=dtype)
-        else:
-            print("Using old vit clip")
-            clip_device = next(clip.parameters()).device
-            pixel_values = clip_preprocess(image.to(clip_device)).float()
-            out = clip(pixel_values=pixel_values)
-            neg_out = clip(pixel_values=torch.zeros_like(pixel_values))    
-            neg_out = neg_out[2].to(dtype=dtype)
-            out = out[2].to(dtype=dtype)
-        pbar.update(mul)
-        if not is_patched:
-            print("We are patching diffusion model, be patient please")
-            patches = FluxUpdateModules(tyanochky, pbar)
-            print("Patched succesfully!")
-        else:
-            print("Model already updated")
-        pbar.update(mul)
-
-        #TYANOCHKYBY=16
-        ip_projes_dev = next(ip_adapter_flux['ip_adapter_proj_model'].parameters()).device
-        ip_adapter_flux['ip_adapter_proj_model'].to(dtype=dtype)
-        ip_projes = ip_adapter_flux['ip_adapter_proj_model'](out.to(ip_projes_dev, dtype=dtype)).to(device, dtype=dtype)
-        ip_neg_pr = ip_adapter_flux['ip_adapter_proj_model'](neg_out.to(ip_projes_dev, dtype=dtype)).to(device, dtype=dtype)
-
-        ipad_blocks = []
-        for block in ip_adapter_flux['double_blocks']:
-            ipad = IPProcessor(block.context_dim, block.hidden_dim, ip_projes, ip_scale)
-            ipad.load_state_dict(block.state_dict())
-            ipad.in_hidden_states_neg = ip_neg_pr
-            ipad.in_hidden_states_pos = ip_projes
-            ipad.to(dtype=dtype)
-            npp = DoubleStreamMixerProcessor()
-            npp.add_ipadapter(ipad)
-            ipad_blocks.append(npp)
-        pbar.update(mul)
-
-        i = 0
-        for name, _ in attn_processors(tyanochky.diffusion_model).items():
-            attribute = f"diffusion_model.{name}"
-            #old = copy.copy(get_attr(bi.model, attribute))
-            if attribute in model.object_patches.keys():
-                old = copy.copy(model.object_patches[attribute])
+            is_patched = is_model_patched(model.model)
+            print(f"Is model already patched? {is_patched}")
+            
+            mul = 1
+            if is_patched:
+                pbar = ProgressBar(5)
             else:
-                old = None
-            processor = merge_loras(old, ipad_blocks[i])
-            processor.to(device, dtype=dtype)
-            bi.add_object_patch(attribute, processor)
-            i += 1
-        pbar.update(mul)
-        return (bi,)
+                mul = 3
+                count = len(model.model.diffusion_model.double_blocks)
+                pbar = ProgressBar(5*mul+count)
+
+            bi = model.clone()
+            tyanochky = bi.model
+
+            clip = ip_adapter_flux['clip_vision']
+
+            if isinstance(clip, FluxClipViT):
+                #torch.Size([1, 526, 526, 3])
+                #image = torch.permute(image, (0, ))
+                #print(image.shape)
+                #print(image)
+                clip_device = next(clip.model.parameters()).device
+                image = torch.clip(image*255, 0.0, 255)
+                out = clip(image).to(dtype=dtype)
+                neg_out = clip(torch.zeros_like(image)).to(dtype=dtype)
+            else:
+                print("Using old vit clip")
+                clip_device = next(clip.parameters()).device
+                pixel_values = clip_preprocess(image.to(clip_device)).float()
+                out = clip(pixel_values=pixel_values)
+                neg_out = clip(pixel_values=torch.zeros_like(pixel_values))    
+                neg_out = neg_out[2].to(dtype=dtype)
+                out = out[2].to(dtype=dtype)
+            pbar.update(mul)
+
+            # Getting image_emb
+            #TYANOCHKYBY=16
+            ip_projes_dev = next(ip_adapter_flux['ip_adapter_proj_model'].parameters()).device
+            ip_adapter_flux['ip_adapter_proj_model'].to(dtype=dtype)
+            ip_projes = ip_adapter_flux['ip_adapter_proj_model'](out.to(ip_projes_dev, dtype=dtype)).to(device, dtype=dtype)
+            ip_neg_pr = ip_adapter_flux['ip_adapter_proj_model'](neg_out.to(ip_projes_dev, dtype=dtype)).to(device, dtype=dtype)
+
+            image_emb = ip_projes
+            #print("ip_projes shape:", ip_projes.shape)
+
+            # Collecting ip_attn_procs
+            ip_attn_procs = {}
+            for i, block in enumerate(ip_adapter_flux['double_blocks']):
+                ipad = IPProcessor(block.context_dim, block.hidden_dim, ip_projes, ip_scale)
+                ipad.load_state_dict(block.state_dict())
+                ipad.in_hidden_states_pos = ip_projes
+                ipad.in_hidden_states_neg = ip_neg_pr
+                ipad.to(dtype=dtype)
+                npp = DoubleStreamMixerProcessor()
+                npp.add_ipadapter(ipad)
+                npp.to(dtype=dtype)
+                ip_attn_procs[f"double_blocks.{i}"] = npp
+
+            pbar.update(mul)
+
+            if not is_patched:
+                print("We are patching diffusion model with IPA blocks, be patient please")
+                FluxUpdateModules(bi, pbar=pbar, ip_attn_procs=ip_attn_procs, image_emb=image_emb, is_patched=False)
+                print("Patched successfully with IPA blocks!")
+            else:
+                print("Model already patched — skipping")
+
+            pbar.update(mul)
+            return (bi,)
 
 
 
@@ -674,7 +668,7 @@ class ApplyAdvancedFluxIPAdapter:
         offload_device = mm.unet_offload_device()
         dtype = torch.float16 if mm.should_use_fp16(device) else torch.bfloat16
 
-        is_patched = is_model_pathched(model.model)
+        is_patched = is_model_patched(model.model)
 
         print(f"Is model already patched? {is_patched}")
         mul = 1
@@ -707,15 +701,6 @@ class ApplyAdvancedFluxIPAdapter:
             neg_out = clip(pixel_values=torch.zeros_like(pixel_values))
             neg_out = neg_out[2].to(dtype=dtype)
             out = out[2].to(dtype=dtype)
-        
-        pbar.update(mul)
-        if not is_patched:
-            print("We are patching diffusion model, be patient please")
-            patches = FluxUpdateModules(tyanochky, pbar)
-            print("Patched succesfully!")
-        else:
-            print("Model already updated")
-        pbar.update(mul)
 
         #TYANOCHKYBY=16
         ip_projes_dev = next(ip_adapter_flux['ip_adapter_proj_model'].parameters()).device
@@ -740,17 +725,18 @@ class ApplyAdvancedFluxIPAdapter:
         else:
             raise ValueError("Invalid smothing type")
 
-        ipad_blocks = []
+        # Collecting ip_attn_procs
+        ip_attn_procs = {}
         for i, block in enumerate(ip_adapter_flux['double_blocks']):
-            ipad = IPProcessor(block.context_dim, block.hidden_dim, ip_projes, strength_model[i])
+            ipad = IPProcessor(block.context_dim, block.hidden_dim, ip_projes, ip_scale)
             ipad.load_state_dict(block.state_dict())
-            ipad.in_hidden_states_neg = ip_neg_pr
             ipad.in_hidden_states_pos = ip_projes
+            ipad.in_hidden_states_neg = ip_neg_pr
             ipad.to(dtype=dtype)
             npp = DoubleStreamMixerProcessor()
             npp.add_ipadapter(ipad)
-            ipad_blocks.append(npp)
-        pbar.update(mul)
+            npp.to(dtype=dtype)
+            ip_attn_procs[f"double_blocks.{i}"] = npp
 
         i = 0
         for name, _ in attn_processors(tyanochky.diffusion_model).items():
@@ -764,6 +750,15 @@ class ApplyAdvancedFluxIPAdapter:
             processor.to(device, dtype=dtype)
             bi.add_object_patch(attribute, processor)
             i += 1
+        pbar.update(mul)
+
+        if not is_patched:
+            print("We are patching diffusion model with IPA blocks, be patient please")
+            FluxUpdateModules(bi, pbar=pbar, ip_attn_procs=ip_attn_procs, image_emb=image_emb, is_patched=False)
+            print("Patched successfully with IPA blocks!")
+        else:
+            print("Model already patched — skipping")
+
         pbar.update(mul)
         return (bi,)
 

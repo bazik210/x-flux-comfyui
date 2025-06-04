@@ -2,11 +2,13 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.nn as nn
 from einops import rearrange
 from torch import Tensor, nn
 
 from .xflux.src.flux.math import attention, rope
 from .xflux.src.flux.modules.layers import LoRALinearLayer
+from comfy.ldm.flux.layers import DoubleStreamBlock
 
 from torch.nn import functional as F
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
@@ -83,7 +85,7 @@ class DoubleStreamBlockLorasMixerProcessor(nn.Module):
         for i in range(count):
             origin += layer[i](inputs)*self.lora_weight[i]*gating
         
-    def forward(self, attn, img, txt, vec, pe, **attention_kwargs):
+    def forward(self, attn, img, txt, vec, pe, attn_mask=None, **attention_kwargs):
         img_mod1, img_mod2 = attn.img_mod(vec)
         txt_mod1, txt_mod2 = attn.txt_mod(vec)
 
@@ -117,7 +119,7 @@ class DoubleStreamBlockLorasMixerProcessor(nn.Module):
         k = torch.cat((txt_k, img_k), dim=2)
         v = torch.cat((txt_v, img_v), dim=2)
 
-        attn1 = attention(q, k, v, pe=pe)
+        attn1 = attention(q, k, v, attn_mask)
         txt_attn, img_attn = attn1[:, : txt.shape[1]], attn1[:, txt.shape[1] :]
 
         # calculate the img bloks
@@ -145,7 +147,7 @@ class DoubleStreamBlockLoraProcessor(nn.Module):
         self.proj_lora2 = LoRALinearLayer(dim, dim, rank, network_alpha)
         self.lora_weight = lora_weight
 
-    def forward(self, attn, img, txt, vec, pe, **attention_kwargs):
+    def forward(self, attn, img, txt, vec, pe, attn_mask=None, **attention_kwargs):
         img_mod1, img_mod2 = attn.img_mod(vec)
         txt_mod1, txt_mod2 = attn.txt_mod(vec)
 
@@ -168,7 +170,7 @@ class DoubleStreamBlockLoraProcessor(nn.Module):
         k = torch.cat((txt_k, img_k), dim=2)
         v = torch.cat((txt_v, img_v), dim=2)
 
-        attn1 = attention(q, k, v, pe=pe)
+        attn1 = attention(q, k, v, pe=pe, mask=attn_mask)
         txt_attn, img_attn = attn1[:, : txt.shape[1]], attn1[:, txt.shape[1] :]
 
         # calculate the img bloks
@@ -180,52 +182,32 @@ class DoubleStreamBlockLoraProcessor(nn.Module):
         txt = txt + txt_mod2.gate * attn.txt_mlp((1 + txt_mod2.scale) * attn.txt_norm2(txt) + txt_mod2.shift)
         return img, txt
 
+
 class DoubleStreamBlockProcessor(nn.Module):
     def __init__(self):
         super().__init__()
-    def __call__(self, attn, img, txt, vec, pe, **attention_kwargs):
-        img_mod1, img_mod2 = attn.img_mod(vec)
-        txt_mod1, txt_mod2 = attn.txt_mod(vec)
 
-        # prepare image for attention
-        img_modulated = attn.img_norm1(img)
-        img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
-        img_qkv = attn.img_attn.qkv(img_modulated)
-        img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=attn.num_heads)
-        img_q, img_k = attn.img_attn.norm(img_q, img_k, img_v)
-
-        # prepare txt for attention
+    def __call__(self, attn: DoubleStreamBlock, img, txt, vec, pe, attn_mask=None, **kwargs):
+        """
         txt_modulated = attn.txt_norm1(txt)
-        txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
-        txt_qkv = attn.txt_attn.qkv(txt_modulated)
-        txt_q, txt_k, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=attn.num_heads)
-        txt_q, txt_k = attn.txt_attn.norm(txt_q, txt_k, txt_v)
+        if 'ip_embeds' in kwargs and kwargs['ip_embeds'] is not None:
+            ip_embeds = kwargs['ip_embeds']
+            if ip_embeds.shape == txt_modulated.shape:
+                txt = txt + ip_embeds
+            else:
+                print(f"Warning: ip_embeds shape {ip_embeds.shape} does not match txt shape {txt.shape}")
+        """
+        return attn.forward(img=img, txt=txt, vec=vec, pe=pe, attn_mask=attn_mask, **kwargs)
 
-        # run actual attention
-        q = torch.cat((txt_q, img_q), dim=2)
-        k = torch.cat((txt_k, img_k), dim=2)
-        v = torch.cat((txt_v, img_v), dim=2)
-
-        attn1 = attention(q, k, v, pe=pe)
-        txt_attn, img_attn = attn1[:, : txt.shape[1]], attn1[:, txt.shape[1] :]
-
-        # calculate the img bloks
-        img = img + img_mod1.gate * attn.img_attn.proj(img_attn)
-        img = img + img_mod2.gate * attn.img_mlp((1 + img_mod2.scale) * attn.img_norm2(img) + img_mod2.shift)
-
-        # calculate the txt bloks
-        txt = txt + txt_mod1.gate * attn.txt_attn.proj(txt_attn)
-        txt = txt + txt_mod2.gate * attn.txt_mlp((1 + txt_mod2.scale) * attn.txt_norm2(txt) + txt_mod2.shift)
-        return img, txt
-    def forward(self, attn, img, txt, vec, pe, **attention_kwargs):
-        self.__call__(attn, img, txt, vec, pe, **attention_kwargs)
+    def forward(self, attn, img, txt, vec, pe, attn_mask=None, **kwargs):
+        return self.__call__(attn, img, txt, vec, pe, attn_mask=attn_mask, **kwargs)
 
 
 class IPProcessor(nn.Module):
     def __init__(self, context_dim, hidden_dim, ip_hidden_states=None, ip_scale=None, text_scale=None):
         super().__init__()
         self.ip_hidden_states = ip_hidden_states
-        self.ip_scale = ip_scale
+        self.ip_scale = 0.1
         self.text_scale = text_scale
         self.in_hidden_states_neg = None
         self.in_hidden_states_pos = ip_hidden_states
@@ -295,9 +277,14 @@ class ImageProjModel(torch.nn.Module):
         clip_extra_context_tokens = self.norm(clip_extra_context_tokens)
         return clip_extra_context_tokens
 
+def log_tensor(name, tensor):
+    print(f"{name:20s} | shape: {tuple(tensor.shape)} | "
+          f"min: {tensor.min().item():.4f}, max: {tensor.max().item():.4f}, "
+          f"mean: {tensor.mean().item():.4f}, std: {tensor.std().item():.4f} | "
+          f"NaN: {torch.isnan(tensor).any().item()} | Inf: {torch.isinf(tensor).any().item()}")
 
 class DoubleStreamMixerProcessor(DoubleStreamBlockLorasMixerProcessor):
-    def __init__(self,):
+    def __init__(self):
         super().__init__()
         self.ip_adapters = nn.ModuleList()
         
@@ -308,10 +295,12 @@ class DoubleStreamMixerProcessor(DoubleStreamBlockLorasMixerProcessor):
         return self.ip_adapters
     def set_ip_adapters(self, ip_adapters):
         self.ip_adapters = ip_adapters
+        
     def shift_ip(self, img_qkv, attn, x):
-        for block in self.ip_adapters:
-            #x = x*block.text_scale
-            x += torch.mean(block(img_qkv, attn), dim=0, keepdim=True)
+        for i, block in enumerate(self.ip_adapters):
+            ip_output = block(img_qkv, attn)
+            x = x + ip_output
+            #x = x / x.std() * 2.0
         return x
     def scale_txt(self, txt):
         for block in self.ip_adapters:
@@ -341,28 +330,40 @@ class DoubleStreamMixerProcessor(DoubleStreamBlockLorasMixerProcessor):
                 self.proj_lora2.append(processor.proj_lora2)
             if hasattr(processor, "lora_weight"):
                 self.lora_weight.append(processor.lora_weight)
+                
+    def apply_loras(self, lora_list, inputs, weights, gating=1.0):
+        if not lora_list:
+            return None
+        result = torch.zeros_like(lora_list[0](inputs))
+        for i, lora_module in enumerate(lora_list):
+            w = weights[i] if i < len(weights) else 1.0
+            result += lora_module(inputs) * w * gating
+        return result
+                
+    def __call__(self, attn, img, txt, vec, pe, attn_mask=None, **kwargs):
+        return self.forward(attn, img, txt, vec, pe, attn_mask=attn_mask, **kwargs)
 
-    def forward(self, attn, img, txt, vec, pe, **attention_kwargs):
+    def forward(self, attn, img, txt, vec, pe, attn_mask=None, **attention_kwargs):
+        # === STEP 1: extract modulation for both streams
         img_mod1, img_mod2 = attn.img_mod(vec)
         txt_mod1, txt_mod2 = attn.txt_mod(vec)
 
-        # prepare image for attention
+        # === STEP 2: prepare and modulate image input
         img_modulated = attn.img_norm1(img)
         img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
-        
+
         #img_qkv = attn.img_attn.qkv(img_modulated) + self.qkv_lora1(img_modulated) * self.lora_weight
         img_qkv = attn.img_attn.qkv(img_modulated)
         #print(self.qkv_lora1)
         self.add_shift(self.qkv_lora1, img_qkv, img_modulated)
-            
         
+        # === STEP 3: extract QKV for IPAdapter
         img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=attn.num_heads)
         img_q, img_k = attn.img_attn.norm(img_q, img_k, img_v)
 
-        # prepare txt for attention
+        # Normalization and modulation for text
         txt_modulated = attn.txt_norm1(txt)
         txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
-        
         
         #txt_qkv = attn.txt_attn.qkv(txt_modulated) + self.qkv_lora2(txt_modulated) * self.lora_weight
         txt_qkv = attn.txt_attn.qkv(txt_modulated)
@@ -370,30 +371,50 @@ class DoubleStreamMixerProcessor(DoubleStreamBlockLorasMixerProcessor):
         
         txt_q, txt_k, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=attn.num_heads)
         txt_q, txt_k = attn.txt_attn.norm(txt_q, txt_k, txt_v)
-
+        
         # run actual attention
         q = torch.cat((txt_q, img_q), dim=2)
         k = torch.cat((txt_k, img_k), dim=2)
         v = torch.cat((txt_v, img_v), dim=2)
-
+        
         attn1 = attention(q, k, v, pe=pe)
         txt_attn, img_attn = attn1[:, : txt.shape[1]], attn1[:, txt.shape[1] :]
-
-        # calculate the img bloks
-        #img = img + img_mod1.gate * attn.img_attn.proj(img_attn) + img_mod1.gate * self.proj_lora1(img_attn) * self.lora_weight
-        img = img + img_mod1.gate * attn.img_attn.proj(img_attn)
-        self.add_shift(self.proj_lora1, img, img_attn, img_mod1.gate)        
-        img = img + img_mod2.gate * attn.img_mlp((1 + img_mod2.scale) * attn.img_norm2(img) + img_mod2.shift)
-
         
+        lora_out = self.apply_loras(self.proj_lora1, img_attn, self.lora_weight, img_mod1.gate)
+        
+        if lora_out is not None:
+            img = img + img_mod1.gate * attn_out + img_mod1.gate * lora_out
+
+        img = img + img_mod1.gate * img_attn
+        #img = img + img_mod1.gate * attn.img_attn.proj(img_attn)
+        
+        #if self.proj_lora1 is not None:
+        #    self.add_shift(self.proj_lora1, img, img_attn, img_mod1.gate)   
+            
+        #img = img + img_mod2.gate * attn.img_mlp((1 + img_mod2.scale) * attn.img_norm2(img) + img_mod2.shift)
+        
+        #mlp_out = attn.img_mlp(img_modulated)
+        #img = img + (img_mod2.gate * 0.3) * mlp_out
+        
+        # === STEP 4: run IPAdapter logic
+        #img_before_ip = img.clone()
+
         img = self.shift_ip(img_q, attn, img)
-        # calculate the txt bloks
-        #txt = txt + txt_mod1.gate * attn.txt_attn.proj(txt_attn) + txt_mod1.gate * self.proj_lora2(txt_attn) * self.lora_weight
-        txt = txt + txt_mod1.gate * attn.txt_attn.proj(txt_attn) 
+
+        #log_tensor("img (after IPAdapter)", img)
+        #log_tensor("delta IPAdapter", img - img_before_ip)
         
+        #txt = txt + txt_mod1.gate * attn.txt_attn.proj(txt_attn)
         
-        txt = txt + txt_mod2.gate * attn.txt_mlp((1 + txt_mod2.scale) * attn.txt_norm2(txt) + txt_mod2.shift)
-        #txt = self.scale_txt(txt)
-        self.add_shift(self.proj_lora2, txt, txt_attn, txt_mod1.gate)
+        #txt_attn_out = attn.txt_attn(txt_modulated)
+        #txt = txt + txt_mod1.gate * txt_attn_out
+
+        #txt = txt + txt_mod2.gate * attn.txt_mlp((1 + txt_mod2.scale) * attn.txt_norm2(txt) + txt_mod2.shift)
+
+        #if self.proj_lora2 is not None:
+        #    self.add_shift(self.proj_lora2, txt, txt_attn, txt_mod1.gate)
+        
+        # === STEP 5: continue attention
+        img, txt = attn(img=img, txt=txt, vec=vec, pe=pe, attn_mask=attn_mask, **attention_kwargs)
 
         return img, txt

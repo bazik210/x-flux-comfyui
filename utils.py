@@ -1,40 +1,179 @@
-from comfy.ldm.flux.layers import DoubleStreamBlock as DSBold
 import copy
 import torch
-from .xflux.src.flux.modules.layers import DoubleStreamBlock as DSBnew
+import numpy as np
+from torch import Tensor, nn
+from types import MethodType
 from .layers import (DoubleStreamBlockLoraProcessor,
                      DoubleStreamBlockProcessor,
                      DoubleStreamBlockLorasMixerProcessor,
                      DoubleStreamMixerProcessor)
 
 from comfy.utils import get_attr, set_attr
+from comfy.ldm.flux.layers import timestep_embedding
+#from comfy.ldm.flux.layers import DoubleStreamBlock as DSBold
+from .xflux.src.flux.modules.layers import DoubleStreamBlock
 
-import numpy as np
 
-def CopyDSB(oldDSB):
-
-    if isinstance(oldDSB, DSBold):
-        tyan = copy.copy(oldDSB)
-
-        if hasattr(tyan.img_mlp[0], 'out_features'):
-            mlp_hidden_dim = tyan.img_mlp[0].out_features
+class DoubleStreamBlockAdapter(nn.Module):
+    def __init__(self, oldDSB):
+        super().__init__()
+        self.oldDSB = oldDSB
+        
+        if hasattr(oldDSB.img_mlp[0], 'out_features'):
+            mlp_hidden_dim = oldDSB.img_mlp[0].out_features
         else:
             mlp_hidden_dim = 12288
 
-        mlp_ratio = mlp_hidden_dim / tyan.hidden_size
-        bi = DSBnew(hidden_size=tyan.hidden_size, num_heads=tyan.num_heads, mlp_ratio=mlp_ratio)
+        mlp_ratio = mlp_hidden_dim / oldDSB.hidden_size
+        
+        self.DSBnew = DoubleStreamBlock(
+            hidden_size=oldDSB.hidden_size,
+            num_heads=oldDSB.num_heads,
+            mlp_ratio=mlp_ratio
+        )
         #better use __dict__ but I bit scared
         (
-            bi.img_mod, bi.img_norm1, bi.img_attn, bi.img_norm2,
-            bi.img_mlp, bi.txt_mod, bi.txt_norm1, bi.txt_attn, bi.txt_norm2, bi.txt_mlp
+            self.DSBnew.img_mod, self.DSBnew.img_norm1, self.DSBnew.img_attn, self.DSBnew.img_norm2,
+            self.DSBnew.img_mlp, self.DSBnew.txt_mod, self.DSBnew.txt_norm1, self.DSBnew.txt_attn, self.DSBnew.txt_norm2, self.DSBnew.txt_mlp
         ) = (
-            tyan.img_mod, tyan.img_norm1, tyan.img_attn, tyan.img_norm2,
-            tyan.img_mlp, tyan.txt_mod, tyan.txt_norm1, tyan.txt_attn, tyan.txt_norm2, tyan.txt_mlp
+            oldDSB.img_mod, oldDSB.img_norm1, oldDSB.img_attn, oldDSB.img_norm2,
+            oldDSB.img_mlp, oldDSB.txt_mod, oldDSB.txt_norm1, oldDSB.txt_attn, oldDSB.txt_norm2, oldDSB.txt_mlp
         )
-        bi.set_processor(DoubleStreamBlockProcessor())
+        self.DSBnew.set_processor(DoubleStreamBlockProcessor())
 
-        return bi
-    return oldDSB
+    def forward(self, img, txt, vec, pe, attn_mask=None, t=None, **kwargs):
+        return self.DSBnew.processor(self.oldDSB, img, txt, vec, pe, attn_mask=attn_mask)
+    
+class WrappedMixerProcessor(nn.Module):
+    def __init__(self, processor, attn):
+        super().__init__()
+        self.processor_fn = processor
+        self.attn = attn
+
+    def forward(self, _attn, img, txt, vec, pe, attn_mask=None, **kwargs):
+        return self.processor_fn(self.attn, img, txt, vec, pe, attn_mask=attn_mask, **kwargs)
+    
+def FluxUpdateModules(bi, pbar=None, ip_attn_procs=None, image_emb=None, is_patched=False):
+    flux_model = bi.model
+
+    flux_model.diffusion_model.forward_orig = MethodType(forward_orig_ipa, flux_model.diffusion_model)
+
+    for i, oldDSB in enumerate(flux_model.diffusion_model.double_blocks):
+        patch_name = f"double_blocks.{i}"
+        if ip_attn_procs is not None and patch_name not in ip_attn_procs:
+            continue
+
+        newDSB = DoubleStreamBlockAdapter(oldDSB)
+        wrapped_proc = WrappedMixerProcessor(ip_attn_procs[patch_name], oldDSB)
+        newDSB.DSBnew.set_processor(wrapped_proc)
+        flux_model.diffusion_model.double_blocks[i] = newDSB
+
+        if pbar:
+            pbar.update(1)
+
+def forward_orig_ipa(
+    self,
+    img: torch.Tensor,
+    img_ids: torch.Tensor,
+    txt: torch.Tensor,
+    txt_ids: torch.Tensor,
+    timesteps: torch.Tensor,
+    y: torch.Tensor,
+    guidance: torch.Tensor | None = None,
+    control=None,
+    transformer_options={},
+    attn_mask: torch.Tensor = None,
+) -> torch.Tensor:
+    patches_replace = transformer_options.get("patches_replace", {})
+    if img.ndim != 3 or txt.ndim != 3:
+        raise ValueError("Input img and txt tensors must have 3 dimensions.")
+
+    img = self.img_in(img)
+    vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
+    if self.params.guidance_embed:
+        if guidance is None:
+            raise ValueError("Didn't get guidance strength for guidance distilled model.")
+        vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
+
+    vec = vec + self.vector_in(y[:, :self.params.vec_in_dim])
+    txt = self.txt_in(txt)
+
+    ids = torch.cat((txt_ids, img_ids), dim=1)
+    pe = self.pe_embedder(ids)
+
+    blocks_replace = patches_replace.get("dit", {})
+    for i, block in enumerate(self.double_blocks):
+        if ("double_block", i) in blocks_replace:
+            def block_wrap(args):
+                out = {}
+                out["img"], out["txt"] = block(
+                    img=args["img"], txt=args["txt"], vec=args["vec"],
+                    pe=args["pe"], t=args["timesteps"], attn_mask=args.get("attn_mask")
+                )
+                return out
+
+            out = blocks_replace[("double_block", i)](
+                {"img": img, "txt": txt, "vec": vec, "pe": pe, "timesteps": timesteps, "attn_mask": attn_mask},
+                {"original_block": block_wrap, "transformer_options": transformer_options}
+            )
+            img, txt = out["img"], out["txt"]
+        else:
+            try:
+                img, txt = block(img=img, txt=txt, vec=vec, pe=pe, t=timesteps, attn_mask=attn_mask)
+            except TypeError:
+                img, txt = block(img=img, txt=txt, vec=vec, pe=pe, attn_mask=attn_mask)
+
+        if control is not None:
+            control_i = control.get("input")
+            if i < len(control_i):
+                add = control_i[i]
+                if add is not None:
+                    img += add
+
+    img = torch.cat((txt, img), 1)
+
+    for i, block in enumerate(self.single_blocks):
+        if ("single_block", i) in blocks_replace:
+            def block_wrap(args):
+                out = {}
+                out["img"] = block(
+                    args["img"], vec=args["vec"], pe=args["pe"],
+                    t=args["timesteps"], attn_mask=args.get("attn_mask")
+                )
+                return out
+
+            out = blocks_replace[("single_block", i)](
+                {"img": img, "vec": vec, "pe": pe, "timesteps": timesteps, "attn_mask": attn_mask},
+                {"original_block": block_wrap, "transformer_options": transformer_options}
+            )
+            img = out["img"]
+        else:
+            try:
+                img = block(img, vec=vec, pe=pe, t=timesteps, attn_mask=attn_mask)
+            except TypeError:
+                img = block(img, vec=vec, pe=pe, attn_mask=attn_mask)
+
+        if control is not None:
+            control_o = control.get("output")
+            if i < len(control_o):
+                add = control_o[i]
+                if add is not None:
+                    img[:, txt.shape[1]:, ...] += add
+
+    img = img[:, txt.shape[1]:, ...]
+    img = self.final_layer(img, vec)
+
+    return img
+
+def is_model_patched(model):
+    def test(mod):
+        if isinstance(mod, DoubleStreamBlockAdapter):
+            return True
+        for child in mod.children():
+            if test(child):
+                return True
+        return False
+    return test(model)
 
 def copy_model(orig, new):
     new = copy.copy(new)
@@ -44,7 +183,7 @@ def copy_model(orig, new):
     count = len(new.model.diffusion_model.double_blocks)
     for i in range(count):
         new.model.diffusion_model.double_blocks[i] = copy.copy(orig.model.diffusion_model.double_blocks[i])
-        new.model.diffusion_model.double_blocks[i].load_state_dict(orig.model.diffusion_model.double_blocks[0].state_dict())
+        new.model.diffusion_model.double_blocks[i].load_state_dict(orig.model.diffusion_model.double_blocks[i].state_dict())
 """
 class PbarWrapper:
     def __init__(self):
@@ -71,34 +210,6 @@ class PbarWrapper:
         self.rn+=1
         return 1
 """
-def FluxUpdateModules(flux_model, pbar=None):
-    save_list = {}
-    #print((flux_model.diffusion_model.double_blocks))
-    #for k,v in flux_model.diffusion_model.double_blocks:
-        #if "double" in k:
-    count = len(flux_model.diffusion_model.double_blocks)
-    patches = {}
-
-    for i in range(count):
-        if pbar is not None:
-            pbar.update(1)
-        patches[f"double_blocks.{i}"]=CopyDSB(flux_model.diffusion_model.double_blocks[i])
-        flux_model.diffusion_model.double_blocks[i]=CopyDSB(flux_model.diffusion_model.double_blocks[i])
-    return patches
-
-def is_model_pathched(model):
-    def test(mod):
-        if isinstance(mod, DSBnew):
-            return True
-        else:
-            for p in mod.children():
-                if test(p):
-                    return True
-        return False
-    result = test(model)
-    return result
-
-
 
 def attn_processors(model_flux):
     # set recursively

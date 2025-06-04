@@ -111,13 +111,13 @@ class LoRALinearLayer(nn.Module):
         return up_hidden_states.to(orig_dtype)
 
 class FLuxSelfAttnProcessor:
-    def __call__(self, attn, x, pe, **attention_kwargs):
+    def __call__(self, attn, x, pe, attn_mask=None, **attention_kwargs):
         print('2' * 30)
 
         qkv = attn.qkv(x)
         q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         q, k = attn.norm(q, k, v)
-        x = attention(q, k, v, pe=pe)
+        x = attention(q, k, v, pe=pe, mask=attn_mask)
         x = attn.proj(x)
         return x
 
@@ -130,11 +130,11 @@ class LoraFluxAttnProcessor(nn.Module):
         self.lora_weight = lora_weight
 
 
-    def __call__(self, attn, x, pe, **attention_kwargs):
+    def __call__(self, attn, x, pe, attn_mask=None, **attention_kwargs):
         qkv = attn.qkv(x) + self.qkv_lora(x) * self.lora_weight
         q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         q, k = attn.norm(q, k, v)
-        x = attention(q, k, v, pe=pe)
+        x = attention(q, k, v, pe=pe, mask=attn_mask)
         x = attn.proj(x) + self.proj_lora(x) * self.lora_weight
         print('1' * 30)
         print(x.norm(), (self.proj_lora(x) * self.lora_weight).norm(), 'norm')
@@ -149,7 +149,8 @@ class SelfAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.norm = QKNorm(head_dim)
         self.proj = nn.Linear(dim, dim)
-    def forward():
+
+    def forward(self, x):
         pass
 
 
@@ -169,11 +170,14 @@ class Modulation(nn.Module):
 
     def forward(self, vec: Tensor) -> tuple[ModulationOut, ModulationOut | None]:
         out = self.lin(nn.functional.silu(vec))[:, None, :].chunk(self.multiplier, dim=-1)
-
-        return (
+        mod_out = (
             ModulationOut(*out[:3]),
             ModulationOut(*out[3:]) if self.is_double else None,
         )
+        for i, mo in enumerate(mod_out):
+            if mo is not None:
+                print(f"ModulationOut[{i}]: shift norm={mo.shift.norm().item():.4f}, scale norm={mo.scale.norm().item():.4f}, gate norm={mo.gate.norm().item():.4f}")
+        return mod_out
 
 class DoubleStreamBlockLoraProcessor(nn.Module):
     def __init__(self, dim: int, rank=4, network_alpha=None, lora_weight=1):
@@ -184,7 +188,7 @@ class DoubleStreamBlockLoraProcessor(nn.Module):
         self.proj_lora2 = LoRALinearLayer(dim, dim, rank, network_alpha)
         self.lora_weight = lora_weight
 
-    def forward(self, attn, img, txt, vec, pe, **attention_kwargs):
+    def forward(self, attn, img, txt, vec, pe, attn_mask=None, **attention_kwargs):
         img_mod1, img_mod2 = attn.img_mod(vec)
         txt_mod1, txt_mod2 = attn.txt_mod(vec)
 
@@ -207,7 +211,7 @@ class DoubleStreamBlockLoraProcessor(nn.Module):
         k = torch.cat((txt_k, img_k), dim=2)
         v = torch.cat((txt_v, img_v), dim=2)
 
-        attn1 = attention(q, k, v, pe=pe)
+        attn1 = attention(q, k, v, pe=pe, mask=attn_mask)
         txt_attn, img_attn = attn1[:, : txt.shape[1]], attn1[:, txt.shape[1] :]
 
         # calculate the img bloks
@@ -246,7 +250,7 @@ class DoubleStreamBlockProcessor(nn.Module):
         k = torch.cat((txt_k, img_k), dim=2)
         v = torch.cat((txt_v, img_v), dim=2)
 
-        attn1 = attention(q, k, v, pe=pe, attn_mask=attn_mask)
+        attn1 = attention(q, k, v, pe=pe, mask=attn_mask)
         txt_attn, img_attn = attn1[:, : txt.shape[1]], attn1[:, txt.shape[1] :]
 
         # calculate the img blocks
@@ -261,32 +265,35 @@ class DoubleStreamBlockProcessor(nn.Module):
 class DoubleStreamBlock(nn.Module):
     def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False):
         super().__init__()
+        
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.num_heads = num_heads
         self.hidden_size = hidden_size
+
+        # === Image stream ===
         self.img_mod = Modulation(hidden_size, double=True)
         self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.img_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
-
-        self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)      
         self.img_mlp = nn.Sequential(
             nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
             nn.GELU(approximate="tanh"),
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
         )
 
+        # === Text stream ===
         self.txt_mod = Modulation(hidden_size, double=True)
         self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.txt_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
-
         self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.txt_mlp = nn.Sequential(
             nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
             nn.GELU(approximate="tanh"),
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
         )
-        processor = DoubleStreamBlockProcessor()
-        self.set_processor(processor)
+
+        # === Processor ===
+        self.set_processor(DoubleStreamBlockProcessor())
 
     def set_processor(self, processor) -> None:
         self.processor = processor
@@ -294,7 +301,14 @@ class DoubleStreamBlock(nn.Module):
     def get_processor(self):
         return self.processor
 
-    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, attn_mask: Optional[Tensor] = None) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        img: Tensor,
+        txt: Tensor,
+        vec: Tensor,
+        pe: Tensor,
+        attn_mask: Optional[Tensor] = None
+    ) -> tuple[Tensor, Tensor]:
         return self.processor(self, img, txt, vec, pe, attn_mask=attn_mask)
 
 class SingleStreamBlock(nn.Module):
@@ -330,7 +344,7 @@ class SingleStreamBlock(nn.Module):
         self.mlp_act = nn.GELU(approximate="tanh")
         self.modulation = Modulation(hidden_size, double=False)
 
-    def forward(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
+    def forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask=None) -> Tensor:
         mod, _ = self.modulation(vec)
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
         qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
@@ -339,7 +353,7 @@ class SingleStreamBlock(nn.Module):
         q, k = self.norm(q, k, v)
 
         # compute attention
-        attn = attention(q, k, v, pe=pe)
+        attn = attention(q, k, v, pe=pe, mask=attn_mask)
         # compute activation in mlp stream, cat again and run second linear layer
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
         return x + mod.gate * output
