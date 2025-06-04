@@ -41,33 +41,50 @@ class DoubleStreamBlockAdapter(nn.Module):
         )
         self.DSBnew.set_processor(DoubleStreamBlockProcessor())
 
-    def forward(self, img, txt, vec, pe, attn_mask=None, t=None, **kwargs):
+    def forward(self, img, txt, vec, pe, attn_mask=None, t=None, ip_scale=None, **kwargs):
         return self.DSBnew.processor(self.oldDSB, img, txt, vec, pe, attn_mask=attn_mask)
     
 class WrappedMixerProcessor(nn.Module):
-    def __init__(self, processor, attn):
+    def __init__(self, processor, attn, ip_scale):
         super().__init__()
         self.processor_fn = processor
         self.attn = attn
+        self.ip_scale = ip_scale
 
-    def forward(self, _attn, img, txt, vec, pe, attn_mask=None, **kwargs):
-        return self.processor_fn(self.attn, img, txt, vec, pe, attn_mask=attn_mask, **kwargs)
+    def forward(self, _attn, img, txt, vec, pe, attn_mask=None, ip_scale=None, **kwargs):
+        return self.processor_fn(self.attn, img, txt, vec, pe, attn_mask=attn_mask, ip_scale=self.ip_scale, **kwargs)
     
-def FluxUpdateModules(bi, pbar=None, ip_attn_procs=None, image_emb=None, is_patched=False):
+def FluxUpdateModules(bi, pbar=None, ip_attn_procs=None, image_emb=None, is_patched=False, ip_scale=None):
     flux_model = bi.model
-
     flux_model.diffusion_model.forward_orig = MethodType(forward_orig_ipa, flux_model.diffusion_model)
 
     for i, oldDSB in enumerate(flux_model.diffusion_model.double_blocks):
         patch_name = f"double_blocks.{i}"
         if ip_attn_procs is not None and patch_name not in ip_attn_procs:
             continue
-
+            
         newDSB = DoubleStreamBlockAdapter(oldDSB)
-        wrapped_proc = WrappedMixerProcessor(ip_attn_procs[patch_name], oldDSB)
+        wrapped_proc = WrappedMixerProcessor(ip_attn_procs[patch_name], oldDSB, ip_scale)
         newDSB.DSBnew.set_processor(wrapped_proc)
-        flux_model.diffusion_model.double_blocks[i] = newDSB
-
+        bi.model.diffusion_model.double_blocks[i] = newDSB
+        
+        if pbar:
+            pbar.update(1)
+        
+    return bi
+        
+def FluxUpdateMixerOnly(bi, pbar=None, ip_attn_procs=None, ip_scale=None):
+    flux_model = bi.model
+    
+    for i, block in enumerate(flux_model.diffusion_model.double_blocks):
+        patch_name = f"double_blocks.{i}"
+        if ip_attn_procs is not None and patch_name not in ip_attn_procs:
+            continue
+        
+        wrapped_proc = WrappedMixerProcessor(ip_attn_procs[patch_name], block.oldDSB, ip_scale)
+        block.DSBnew.set_processor(wrapped_proc)
+        #print(f"Updated mixer processor for double_blocks.{i}, ip_scale = {ip_scale}")
+        
         if pbar:
             pbar.update(1)
 

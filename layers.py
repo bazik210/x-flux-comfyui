@@ -207,7 +207,8 @@ class IPProcessor(nn.Module):
     def __init__(self, context_dim, hidden_dim, ip_hidden_states=None, ip_scale=None, text_scale=None):
         super().__init__()
         self.ip_hidden_states = ip_hidden_states
-        self.ip_scale = 0.1
+        self.ip_scale = ip_scale
+        #print(f"IP SCALE: {ip_scale}")
         self.text_scale = text_scale
         self.in_hidden_states_neg = None
         self.in_hidden_states_pos = ip_hidden_states
@@ -219,7 +220,9 @@ class IPProcessor(nn.Module):
         if self.text_scale is None:
             self.text_scale=1.0
         if self.ip_scale is None:
-            self.ip_scale=1.0
+            self.ip_scale=0.35
+        else:
+            self.ip_scale=max(0.0, min(ip_scale * 0.35, 0.35))
         if self.text_scale == 0:
             self.text_scale = 0.0001
         # Initialize projections for IP-adapter
@@ -232,7 +235,7 @@ class IPProcessor(nn.Module):
         nn.init.zeros_(self.ip_adapter_double_stream_v_proj.weight)
         nn.init.zeros_(self.ip_adapter_double_stream_v_proj.bias)
 
-    def forward(self, img_q, attn):
+    def forward(self, img_q, attn, ip_scale=None):
         #img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=attn.num_heads, D=attn.head_dim)
         # IP-adapter processing
         ip_query = img_q  # latent sample query
@@ -252,7 +255,14 @@ class IPProcessor(nn.Module):
             is_causal=False
         )
         ip_attention = rearrange(ip_attention, "B H L D -> B L (H D)", H=attn.num_heads)
-        return ip_attention*self.ip_scale
+        if ip_scale is not None:
+            ip_scale=max(0.0, min(ip_scale * 0.35, 0.35))
+            scale = ip_scale
+        else: 
+            scale = self.ip_scale
+            
+        #print(f"IP SCALE FORWARD: {scale}")
+        return ip_attention*scale
 
 class ImageProjModel(torch.nn.Module):
     """Projection Model
@@ -296,11 +306,12 @@ class DoubleStreamMixerProcessor(DoubleStreamBlockLorasMixerProcessor):
     def set_ip_adapters(self, ip_adapters):
         self.ip_adapters = ip_adapters
         
-    def shift_ip(self, img_qkv, attn, x):
+    def shift_ip(self, img_qkv, attn, x, ip_scale=None):
         for i, block in enumerate(self.ip_adapters):
-            ip_output = block(img_qkv, attn)
+            ip_output = block(img_qkv, attn, ip_scale=ip_scale)
+            #log_tensor("ip_output (before clamp)", ip_output)
+            ip_output = torch.clamp(ip_output, min=-5.0, max=5.0) 
             x = x + ip_output
-            #x = x / x.std() * 2.0
         return x
     def scale_txt(self, txt):
         for block in self.ip_adapters:
@@ -343,7 +354,7 @@ class DoubleStreamMixerProcessor(DoubleStreamBlockLorasMixerProcessor):
     def __call__(self, attn, img, txt, vec, pe, attn_mask=None, **kwargs):
         return self.forward(attn, img, txt, vec, pe, attn_mask=attn_mask, **kwargs)
 
-    def forward(self, attn, img, txt, vec, pe, attn_mask=None, **attention_kwargs):
+    def forward(self, attn, img, txt, vec, pe, attn_mask=None, ip_scale=None, **attention_kwargs):
         # === STEP 1: extract modulation for both streams
         img_mod1, img_mod2 = attn.img_mod(vec)
         txt_mod1, txt_mod2 = attn.txt_mod(vec)
@@ -399,7 +410,7 @@ class DoubleStreamMixerProcessor(DoubleStreamBlockLorasMixerProcessor):
         # === STEP 4: run IPAdapter logic
         #img_before_ip = img.clone()
 
-        img = self.shift_ip(img_q, attn, img)
+        img = self.shift_ip(img_q, attn, img, ip_scale=ip_scale)
 
         #log_tensor("img (after IPAdapter)", img)
         #log_tensor("delta IPAdapter", img - img_before_ip)

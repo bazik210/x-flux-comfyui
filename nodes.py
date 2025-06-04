@@ -19,7 +19,7 @@ from .xflux.src.flux.util import (configs, load_ae, load_clip,
                             load_controlnet)
 
 
-from .utils import (FirstHalfStrengthModel, FluxUpdateModules, LinearStrengthModel, 
+from .utils import (FirstHalfStrengthModel, FluxUpdateModules, FluxUpdateMixerOnly, LinearStrengthModel, 
                 SecondHalfStrengthModel, SigmoidStrengthModel, attn_processors, 
                 set_attn_processor,
                 is_model_patched, merge_loras, LATENT_PROCESSOR_COMFY,
@@ -544,7 +544,7 @@ class LoadFluxIPAdapter:
         pbar.update(1)
         ret_ipa["ip_adapter_proj_model"] = improj
 
-        ret_ipa["double_blocks"] = torch.nn.ModuleList([IPProcessor(4096, 3072) for i in range(19)])
+        ret_ipa["double_blocks"] = torch.nn.ModuleList([IPProcessor(4096, 3072) for _ in range(19)])
         ret_ipa["double_blocks"].load_state_dict(blocks)
         pbar.update(1)
         return (ret_ipa,)
@@ -624,19 +624,20 @@ class ApplyFluxIPAdapter:
                 ipad.load_state_dict(block.state_dict())
                 ipad.in_hidden_states_pos = ip_projes
                 ipad.in_hidden_states_neg = ip_neg_pr
-                ipad.to(dtype=dtype)
+                ipad.to(device, dtype=dtype)
                 npp = DoubleStreamMixerProcessor()
                 npp.add_ipadapter(ipad)
-                npp.to(dtype=dtype)
+                npp.to(device, dtype=dtype)
                 ip_attn_procs[f"double_blocks.{i}"] = npp
 
             pbar.update(mul)
-
+            
             if not is_patched:
                 print("We are patching diffusion model with IPA blocks, be patient please")
-                FluxUpdateModules(bi, pbar=pbar, ip_attn_procs=ip_attn_procs, image_emb=image_emb, is_patched=False)
+                bi = FluxUpdateModules(bi, pbar=pbar, ip_attn_procs=ip_attn_procs, image_emb=image_emb, is_patched=False, ip_scale=ip_scale)
                 print("Patched successfully with IPA blocks!")
             else:
+                FluxUpdateMixerOnly(bi, pbar=pbar, ip_attn_procs=ip_attn_procs, ip_scale=ip_scale)
                 print("Model already patched — skipping")
 
             pbar.update(mul)
@@ -713,6 +714,7 @@ class ApplyAdvancedFluxIPAdapter:
         ip_neg_pr = ip_adapter_flux['ip_adapter_proj_model'](neg_out.to(ip_projes_dev, dtype=dtype)).to(device, dtype=dtype)
 
         count = len(ip_adapter_flux['double_blocks'])
+        image_emb = ip_projes
 
         if smothing_type == "Linear":
             strength_model = LinearStrengthModel(begin_strength, end_strength, count)
@@ -732,10 +734,10 @@ class ApplyAdvancedFluxIPAdapter:
             ipad.load_state_dict(block.state_dict())
             ipad.in_hidden_states_pos = ip_projes
             ipad.in_hidden_states_neg = ip_neg_pr
-            ipad.to(dtype=dtype)
+            ipad.to(device, dtype=dtype)
             npp = DoubleStreamMixerProcessor()
             npp.add_ipadapter(ipad)
-            npp.to(dtype=dtype)
+            npp.to(device, dtype=dtype)
             ip_attn_procs[f"double_blocks.{i}"] = npp
 
         i = 0
@@ -754,9 +756,10 @@ class ApplyAdvancedFluxIPAdapter:
 
         if not is_patched:
             print("We are patching diffusion model with IPA blocks, be patient please")
-            FluxUpdateModules(bi, pbar=pbar, ip_attn_procs=ip_attn_procs, image_emb=image_emb, is_patched=False)
+            bi = FluxUpdateModules(bi, pbar=pbar, ip_attn_procs=ip_attn_procs, image_emb=image_emb, is_patched=False)
             print("Patched successfully with IPA blocks!")
         else:
+            FluxUpdateMixerOnly(bi, pbar=pbar, ip_attn_procs=ip_attn_procs, ip_scale=ip_scale)
             print("Model already patched — skipping")
 
         pbar.update(mul)
